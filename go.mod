@@ -1,3 +1,3 @@
-module song
+module azzurrotech/song
 
-go 1.21
+go 1.20

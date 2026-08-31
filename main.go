@@ -1,221 +1,184 @@
+// Package main implements the song project as a magic link authentication server
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"html/template"
-	"io"
+	"flag"
+	"fmt"
+	"log"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"sync"
 	"time"
-)
 
-type Link struct {
-	Rel  string `json:"rel"`
-	Href string `json:"href"`
-	Method string `json:"method"`
-}
-
-type HATEOASResponse struct {
-	Data  interface{} `json:"data"`
-	Links []Link      `json:"links"`
-}
-
-type Function struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Endpoint    string `json:"endpoint"`
-}
-
-type AuthRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-var (
-	functions   []Function
-	functionsMu sync.RWMutex
-	tokens      = make(map[string]time.Time)
-	tokensMu    sync.Mutex
-	functionsDir string
+	"azzurrotech/song/pkg/auth"
 )
 
 func main() {
-	functionsDir = "functions"
-	os.MkdirAll(functionsDir, 0755)
-	scanFunctions()
+	port := flag.String("port", "8080", "Port to listen on")
+	secretKey := flag.String("secret", "default-secret-key-32-chars-long-123", "Secret key for encryption")
+	help := flag.Bool("help", false, "Show help message")
+	version := flag.Bool("version", false, "Show version information")
 
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/auth", authHandler)
-	http.HandleFunc("/functions/", functionHandler)
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	flag.Parse()
 
-	go func() {
-		for {
-			time.Sleep(30 * time.Second)
-			cleanTokens()
-		}
-	}()
+	if *help {
+		fmt.Println("Usage: song [options]")
+		fmt.Println("  --port     Set the port to listen on (default: 8080)")
+		fmt.Println("  --secret   Secret key for encryption (must be at least 32 chars)")
+		fmt.Println("  --help     Show this help message")
+		fmt.Println("  --version  Show version information")
+		return
+	}
 
-	http.ListenAndServe(":8087", nil)
-}
+	if *version {
+		fmt.Println("Song Server v1.0.0")
+		fmt.Println("Magic Link Authentication Service")
+		fmt.Println("Copyright 2025 Azzurro Technology Inc.")
+		return
+	}
 
-func scanFunctions() {
-	functionsMu.Lock()
-	defer functionsMu.Unlock()
-	functions = nil
-	entries, err := os.ReadDir(functionsDir)
+	authService, err := auth.NewAuthService(*secretKey)
 	if err != nil {
-		return
+		log.Fatalf("Failed to create auth service: %v", err)
 	}
-	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			functions = append(functions, Function{
-				Name:        e.Name(),
-				Description: "Executes " + e.Name(),
-				Endpoint:    "/functions/" + e.Name(),
-			})
-		}
+
+	server := &Server{authService: authService}
+	if err := server.Start(*port); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Header.Get("Accept") == "application/json" {
-		functionsMu.RLock()
-		defer functionsMu.RUnlock()
-		links := []Link{
-			{Rel: "auth", Href: "/auth", Method: "POST"},
-		}
-		for _, f := range functions {
-			links = append(links, Link{Rel: "function", Href: f.Endpoint, Method: "POST"})
-		}
-		resp := HATEOASResponse{Data: functions, Links: links}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-	tmpl := template.Must(template.ParseFiles("templates/index.html"))
-	functionsMu.RLock()
-	defer functionsMu.RUnlock()
-	tmpl.Execute(w, functions)
+type Server struct {
+	authService *auth.AuthService
 }
 
-func authHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, HATEOASResponse{
-			Links: []Link{{Rel: "auth", Href: "/auth", Method: "POST"}},
-		})
-		return
-	}
-	var req AuthRequest
-	json.NewDecoder(r.Body).Decode(&req)
-	if req.Username == "" || req.Password == "" {
-		writeJSON(w, http.StatusBadRequest, HATEOASResponse{
-			Links: []Link{{Rel: "auth", Href: "/auth", Method: "POST"}},
-		})
-		return
-	}
-	h := sha256.Sum256([]byte(req.Username + ":" + req.Password))
-	token := hex.EncodeToString(h[:])
-	tokensMu.Lock()
-	tokens[token] = time.Now().Add(1 * time.Hour)
-	tokensMu.Unlock()
+func (s *Server) Start(port string) error {
+	fmt.Printf("Starting SONG server on port %s\n", port)
+	fmt.Println("Magic Link Authentication Service")
 
-	functionsMu.RLock()
-	var links []Link
-	for _, f := range functions {
-		links = append(links, Link{Rel: "function", Href: f.Endpoint, Method: "POST"})
-	}
-	functionsMu.RUnlock()
-	links = append(links, Link{Rel: "self", Href: "/", Method: "GET"})
+	// Set up authentication routes
+	http.HandleFunc("/api/auth/generate", s.generateMagicLinkHandler)
+	http.HandleFunc("/api/auth/validate", s.validateMagicLinkHandler)
+	http.HandleFunc("/api/auth/revoke", s.revokeMagicLinkHandler)
 
-	writeJSON(w, http.StatusOK, HATEOASResponse{
-		Data:  map[string]string{"token": token},
-		Links: links,
-	})
+	// Set up health check route
+	http.HandleFunc("/health", s.healthCheckHandler)
+
+	return http.ListenAndServe(":"+port, http.DefaultServeMux)
 }
 
-func functionHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, HATEOASResponse{
-			Links: []Link{{Rel: "auth", Href: "/auth", Method: "POST"}},
-		})
-		return
-	}
-	token := r.Header.Get("Authorization")
-	tokensMu.Lock()
-	expiry, ok := tokens[token]
-	tokensMu.Unlock()
-	if !ok || time.Now().After(expiry) {
-		writeJSON(w, http.StatusUnauthorized, HATEOASResponse{
-			Links: []Link{{Rel: "auth", Href: "/auth", Method: "POST"}},
-		})
+func (s *Server) generateMagicLinkHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	name := strings.TrimPrefix(r.URL.Path, "/functions/")
-	if name == "" || strings.Contains(name, "/") {
-		writeJSON(w, http.StatusNotFound, HATEOASResponse{
-			Links: []Link{{Rel: "functions", Href: "/", Method: "GET"}},
-		})
+	var req auth.GenerateLinkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	funcPath := filepath.Join(functionsDir, name)
-	if _, err := os.Stat(funcPath); os.IsNotExist(err) {
-		writeJSON(w, http.StatusNotFound, HATEOASResponse{
-			Links: []Link{{Rel: "functions", Href: "/", Method: "GET"}},
-		})
+	if req.UserID == "" {
+		http.Error(w, "user_id is required", http.StatusBadRequest)
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
-	cmd := exec.Command(funcPath)
-	cmd.Stdin = strings.NewReader(string(body))
-	output, err := cmd.CombinedOutput()
+	magicLink, err := s.authService.GenerateMagicLink(req.UserID, req.DeviceInfo)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, HATEOASResponse{
-			Data:  map[string]string{"error": err.Error()},
-			Links: []Link{{Rel: "functions", Href: "/", Method: "GET"}},
-		})
+		http.Error(w, "Failed to generate magic link: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	functionsMu.RLock()
-	var links []Link
-	for _, f := range functions {
-		links = append(links, Link{Rel: "function", Href: f.Endpoint, Method: "POST"})
-	}
-	functionsMu.RUnlock()
-
-	writeJSON(w, http.StatusOK, HATEOASResponse{
-		Data:  string(output),
-		Links: links,
-	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	json.NewEncoder(w).Encode(auth.GenerateLinkResponse{
+		MagicLink: magicLink.Token,
+		ExpiresAt: magicLink.Expiry,
+	})
 }
 
-func cleanTokens() {
-	tokensMu.Lock()
-	defer tokensMu.Unlock()
-	now := time.Now()
-	for k, v := range tokens {
-		if now.After(v) {
-			delete(tokens, k)
-		}
+func (s *Server) validateMagicLinkHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	var req auth.ValidateLinkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Link == "" || req.UserID == "" {
+		http.Error(w, "link and user_id are required", http.StatusBadRequest)
+		return
+	}
+
+	magicLink, err := s.authService.ValidateMagicLink(req.Link, req.UserID, req.DeviceInfo)
+	if err != nil {
+		http.Error(w, "Invalid magic link: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	if magicLink.Used {
+		http.Error(w, "Magic link already used", http.StatusNotFound)
+		return
+	}
+
+	if time.Now().After(magicLink.Expiry) {
+		s.authService.MarkLinkAsUsed(req.Link)
+		http.Error(w, "Magic link expired", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(auth.ValidateLinkResponse{
+		Valid:     true,
+		UserID:    magicLink.UserID,
+		ExpiresAt: magicLink.Expiry,
+	})
+}
+
+func (s *Server) revokeMagicLinkHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Link string `json:"link"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Link == "" {
+		http.Error(w, "link is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.authService.MarkLinkAsUsed(req.Link); err != nil {
+		http.Error(w, "Failed to revoke magic link: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Magic link revoked successfully",
+	})
+}
+
+func (s *Server) healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now(),
+		"service":   "song-auth",
+		"version":   "1.0.0",
+	})
 }
